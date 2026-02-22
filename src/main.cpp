@@ -1,11 +1,12 @@
 /**
- * ESP32 PID Temperature Controller (Professional Edition)
+ * ESP32 Kalman Filter Temperature Monitoring System
  * ---------------------------------------------------
  * รายละเอียด Hardware:
  * - MCU: ESP32 DevKit V2 Board (THAITECHZONE)
  * - Sensor: DS18B20 (ต่อที่ GPIO 14)
- * - Heater: MOSFET หรือ SSR (ต่อที่ GPIO 13) -> ควบคุมด้วย PWM
+ * - Heater: MOSFET หรือ SSR (ต่อที่ GPIO 13) -> PWM คงที่ 40%
  * - Display: OLED 0.96" (I2C: SDA=21, SCL=22)
+ * - Filter: Kalman Filter สำหรับกรองสัญญาณเซนเซอร์
  */
 
 #include <Arduino.h>
@@ -14,7 +15,8 @@
 #include <Adafruit_SSD1306.h>
 #include <OneWire.h>
 #include <DallasTemperature.h>
-#include <PID_v1.h>
+#include "SimpleKalmanFilter.h"  // Kalman Filter สำหรับกรองสัญญาณเซนเซอร์
+
 
 // =========================================
 // 1. การกำหนดขาพอร์ต (Pin Definitions)
@@ -22,29 +24,20 @@
 #define HEATER_PIN 13    // ขาจ่ายสัญญาณ PWM ไปยัง Heater Driver
 #define ONE_WIRE_BUS 14  // ขา Data ของ Sensor DS18B20
 
-// Manual Control IO (สำรองไว้ใช้ในอนาคต)
-#define SW1_PIN 34       // สวิตช์ 1 (Input Only - ต้องต่อ R Pull-up 10k)
-#define SW2_PIN 35       // สวิตช์ 2 (Input Only - ต้องต่อ R Pull-up 10k)
-#define SW3_PIN 32       // สวิตช์ 3 (มี Internal Pull-up)
-#define RL1_PIN 17       // รีเลย์ 1
-#define RL2_PIN 16       // รีเลย์ 2
-#define RL3_PIN 4        // รีเลย์ 3
-
-// Isolated Inputs (สำรองไว้ใช้ในอนาคต)
-#define ISOIN1_PIN 33
-#define ISOIN2_PIN 27
+// Manual Control IO / Isolated Inputs ถูกตัดออก (ไม่ใช้ในโหมด Fuzzy Logic ล้วน)
 
 // =========================================
 // 2. การตั้งค่าระบบ (System Settings)
 // =========================================
-// ขอบเขตอุณหภูมิและความปลอดภัย
-#define TEMP_MIN 25.0    // ค่าต่ำสุดที่ยอมให้ตั้ง
-#define TEMP_MAX 100.0    // ค่าสูงสุด และจุดตัด Safety Cutoff
+// ขอบเคตอุณหภูมิและความปลอดภัย
+#define TEMP_MIN 0.0     // ค่าต่ำสุดที่ยอมให้ตั้ง
+#define TEMP_MAX 100.0   // ค่าสูงสุด และจุดตัด Safety Cutoff
 
 // การตั้งค่า PWM (สำหรับ ESP32)
 const int PWM_FREQ = 1000;     // ความถี่ 1kHz (เหมาะกับ MOSFET)
 const int PWM_CHANNEL = 0;     // ช่องสัญญาณ PWM 0
 const int PWM_RESOLUTION = 8;  // ความละเอียด 8-bit (ค่า 0-255)
+const int PWM_FIXED_VALUE = 64;  // ค่า PWM คงที่ 20%
 
 // =========================================
 // 3. ประกาศตัวแปรและ Object
@@ -58,27 +51,57 @@ Adafruit_SSD1306 display(SCREEN_WIDTH, SCREEN_HEIGHT, &Wire, -1);
 OneWire oneWire(ONE_WIRE_BUS);
 DallasTemperature sensors(&oneWire);
 
-// ตัวแปร PID
-double Setpoint, Input, Output;
-// ค่า Tuning (ปรับจูนตามความเหมาะสมของระบบจริง)
-double Kp = 10.0, Ki = 0.5, Kd = 1.0; 
-PID myPID(&Input, &Output, &Setpoint, Kp, Ki, Kd, DIRECT);
+// =========================================
+// พารามิเตอร์ Kalman Filter
+// =========================================
+const double KALMAN_Q = 0.01;              // Process Noise (ความผันผวนของกระบวนการ)
+                                            // ค่าต่ำ = อุณหภูมิเปลี่ยนแปลงช้า
+                                            // ค่าสูง = อุณหภูมิเปลี่ยนแปลงเร็ว
+                                            
+const double KALMAN_R = 0.5;               // Sensor Noise (ความผันผวนของเซนเซอร์)
+                                            // ค่าต่ำ = เชื่อค่าเซนเซอร์มาก (กรองน้อย)
+                                            // ค่าสูง = เชื่อค่าเซนเซอร์น้อย (กรองมาก)
+                                            
+const double KALMAN_P = 1.0;               // Estimation Error Covariance (ค่าเริ่มต้น)
+const double KALMAN_INITIAL_VALUE = 25.0;  // ค่าอุณหภูมิเริ่มต้น (°C)
+
+// สร้าง Kalman Filter Object
+SimpleKalmanFilter tempKalmanFilter(KALMAN_Q, KALMAN_R, KALMAN_P, KALMAN_INITIAL_VALUE);
+
+// =========================================
+// ตัวแปรสำหรับการทดสอบ Kalman Filter
+// =========================================
+double rawTemp = 0.0;      // ค่าอุณหภูมิดิบจากเซนเซอร์
+double filteredTemp = 0.0; // ค่าอุณหภูมิหลังผ่าน Kalman Filter
 
 // ตัวแปรจับเวลา
 unsigned long lastDisplayTime = 0;
+unsigned long lastSensorReadTime = 0;
+unsigned long lastSerialDebugTime = 0;
+unsigned long startupTime = 0;
+bool startupComplete = false;
 
-// ประกาศชื่อฟังก์ชันล่วงหน้า (Function Prototypes)
+// Timing Constants
+#define DISPLAY_UPDATE_INTERVAL 200    // ms - อัปเดตหน้าจอ
+#define SENSOR_READ_INTERVAL 250       // ms - อ่านค่า sensor
+#define SERIAL_DEBUG_INTERVAL 500      // ms - แสดงผล Serial
+#define STARTUP_DELAY 1500             // ms - delay เริ่มต้น
+
+// =========================================
+// 4. ประกาศฟังก์ชันล่วงหน้า (Function Prototypes)
+// =========================================
 void updateDisplay();
 void displayError(String title, String msg);
 void debugSerial();
+void drawMainScreen();
 
 void setup() {
   Serial.begin(115200);
   
-  // --- A. ตั้งค่า PWM สำหรับ Heater ---
+  // --- A. ตั้งค่า PWM สำหรับ Heater (คงที่ 40%) ---
   ledcSetup(PWM_CHANNEL, PWM_FREQ, PWM_RESOLUTION);
   ledcAttachPin(HEATER_PIN, PWM_CHANNEL);
-  ledcWrite(PWM_CHANNEL, 0); // เริ่มต้นปิด Heater
+  ledcWrite(PWM_CHANNEL, PWM_FIXED_VALUE); // ตั้งค่า PWM คงที่ 40%
 
   // --- B. เริ่มต้น Sensor ---
   sensors.begin();
@@ -96,109 +119,112 @@ void setup() {
   display.setCursor(10, 20);
   display.println(F("SYSTEM STARTING..."));
   display.setCursor(10, 40);
-  display.println(F("PWM PID CONTROL"));
+  display.println(F("KALMAN FILTER TEST"));
   display.display();
-  delay(1500);
-
-  // --- D. เริ่มต้น PID ---
-  Setpoint = 40.0; // ตั้งค่าเริ่มต้นที่ 50 องศา
   
-  // กำหนดขอบเขต Output ให้ตรงกับ PWM (0-255)
-  myPID.SetOutputLimits(0, 255);
-  myPID.SetMode(AUTOMATIC);
+  // บันทึกเวลาเริ่มต้น (จะรอ 1.5 วินาทีใน loop)
+  startupTime = millis();
 
-  Serial.println(F("--- ESP32 PID Ready ---"));
-  Serial.println(F("Type temp in Serial (e.g., 60.5) to change Setpoint"));
+  Serial.println(F("--- ESP32 Kalman Filter Test ---"));
+  Serial.println(F("PWM Fixed: 40%"));
+  Serial.print(F("Kalman Q:")); Serial.print(KALMAN_Q);
+  Serial.print(F(" R:")); Serial.print(KALMAN_R);
+  Serial.print(F(" P:")); Serial.println(KALMAN_P);
 }
 
 void loop() {
-  // 1. รับคำสั่งเปลี่ยนอุณหภูมิผ่าน Serial
-  if (Serial.available() > 0) {
-    float newSp = Serial.parseFloat();
-    while(Serial.available()) Serial.read(); // เคลียร์ Buffer
-    
-    if (newSp >= TEMP_MIN && newSp <= TEMP_MAX) {
-      Setpoint = newSp;
-      Serial.print(F("New Setpoint: ")); Serial.println(Setpoint);
-    } else if (newSp > 0) {
-      Serial.println(F("Error: Temp out of range!"));
+  unsigned long currentTime = millis();
+  
+  // รอจนกว่าจะผ่านเวลา startup
+  if (!startupComplete) {
+    if (currentTime - startupTime >= STARTUP_DELAY) {
+      startupComplete = true;
+      Serial.println(F("Startup complete!"));
+    } else {
+      return;  // ยังไม่ถึงเวลา ให้รอต่อ
     }
   }
-
-  // 2. อ่านค่าอุณหภูมิ
-  sensors.requestTemperatures(); 
-  double currentTemp = sensors.getTempCByIndex(0);
-
-  // 3. ตรวจสอบความปลอดภัย (Safety Checks)
   
-  // กรณี 3.1: Sensor มีปัญหา (ค่า -127 หรือ 85)
-  if (currentTemp == -127.00 || currentTemp == 85.00) {
-    ledcWrite(PWM_CHANNEL, 0); // ตัด Heater ทันที
+  // 1. อ่านค่าอุณหภูมิ (ทุกๆ SENSOR_READ_INTERVAL)
+  if (currentTime - lastSensorReadTime >= SENSOR_READ_INTERVAL) {
+    sensors.requestTemperatures(); 
+    rawTemp = sensors.getTempCByIndex(0);             // อ่านค่าดิบจากเซนเซอร์
+    filteredTemp = tempKalmanFilter.update(rawTemp);  // กรองด้วย Kalman Filter
+
+    lastSensorReadTime = currentTime;
+  }
+
+  // 2. ตรวจสอบความปลอดภัย (Safety Checks)
+  // กรณี 2.1: Sensor มีปัญหา (ค่า -127 หรือ 85)
+  if (rawTemp == -127.00 || rawTemp == 85.00) {
+    ledcWrite(PWM_CHANNEL, 0); // ปิด Heater ทันที
     displayError("SENSOR", "ERROR");
     return; 
   }
-  
-  Input = currentTemp;
 
-  // กรณี 3.2: อุณหภูมิเกินกำหนด (Overheat)
-  if (Input > TEMP_MAX) {
-    ledcWrite(PWM_CHANNEL, 0); // ตัด Heater ทันที
-    Output = 0;
-    displayError("OVERHEAT", "> 100C");
+  // กรณี 2.2: อุณหภูมิเกินกำหนด (Overheat)
+  if (filteredTemp > TEMP_MAX) {
+    ledcWrite(PWM_CHANNEL, 0); // ปิด Heater ทันที
+    displayError("OVERHEAT", ">100C");
     Serial.println(F("ALARM: Overheat detected!"));
     return;
   }
 
-  // 4. คำนวณ PID
-  myPID.Compute();
-
-  // 5. ส่งค่าไปยัง Hardware (PWM Output)
-  // ส่งค่า 0-255 ไปควบคุมความกว้างพัลส์
-  ledcWrite(PWM_CHANNEL, (int)Output);
-
-  // 6. แสดงผล (ทุกๆ 200ms)
-  if (millis() - lastDisplayTime > 200) {
+  // 3. แสดงผลหน้าจอ (ทุกๆ DISPLAY_UPDATE_INTERVAL)
+  if (currentTime - lastDisplayTime >= DISPLAY_UPDATE_INTERVAL) {
     updateDisplay();
+    lastDisplayTime = currentTime;
+  }
+  
+  // 4. แสดงผล Serial Debug (ทุกๆ SERIAL_DEBUG_INTERVAL)
+  if (currentTime - lastSerialDebugTime >= SERIAL_DEBUG_INTERVAL) {
     debugSerial();
-    lastDisplayTime = millis();
+    lastSerialDebugTime = currentTime;
   }
 }
 
 void updateDisplay() {
+  drawMainScreen();
+}
+
+void drawMainScreen() {
   display.clearDisplay();
 
   // ส่วนหัว
   display.setTextSize(1);
   display.setCursor(0,0);
-  display.print(F("TEMP. PID CONTROL"));
+  display.print(F("KALMAN FILTER"));
 
-  // แสดง PV (ตัวใหญ่)
+  // แสดง Filtered Temperature (ตัวใหญ่)
   display.setTextSize(2);
-  display.setCursor(0, 14);
-  display.print(F("PV:"));
-  display.print(Input, 1); 
+  display.setCursor(0, 12);
+  display.print(filteredTemp, 1); 
+  display.print(F("C"));
 
-  // แสดง Setpoint และ % กำลังไฟ
+  // แสดง Raw Temperature
   display.setTextSize(1);
-  display.setCursor(0, 36);
-  display.print(F("Set:")); display.print(Setpoint, 0);
-  display.print(F(" Pwr:")); 
-  display.print(map(Output, 0, 255, 0, 100)); // แปลงเป็น %
-  display.print(F("%"));
+  display.setCursor(0, 30);
+  display.print(F("Raw: "));
+  display.print(rawTemp, 1);
+  display.print(F("C"));
 
-  // แสดงค่า PID Tuning (Kp, Ki, Kd)
-  display.setCursor(0, 48);
-  display.print(F("P:")); display.print(Kp, 1);
-  display.print(F(" I:")); display.print(Ki, 1);
-  display.print(F(" D:")); display.print(Kd, 1);
+  // แสดง PWM คงที่
+  display.setCursor(0, 40);
+  display.print(F("PWM: 20% (Fixed)"));
 
-  // กราฟแท่งแสดงกำลังไฟ Heater (เต็มหน้าจอ ชิดขวา)
-  int barHeight = map(Output, 0, 255, 0, 64);
+  // แสดง Kalman Gain
+  display.setCursor(0, 50);
+  display.print(F("K-Gain: "));
+  display.print(tempKalmanFilter.getKalmanGain(), 3);
+
+  // กราฟแท่งแสดงกำลังไฟ Heater (คงที่ที่ 40%)
+  int barHeight = map(PWM_FIXED_VALUE, 0, 255, 0, 64);
   display.drawRect(118, 0, 10, 64, WHITE); // กรอบเต็มความสูง
   display.fillRect(118, 64 - barHeight, 10, barHeight, WHITE); // ไส้ใน
 
   display.display();
 }
+
 
 void displayError(String title, String msg) {
   display.clearDisplay();
@@ -216,8 +242,9 @@ void displayError(String title, String msg) {
 }
 
 void debugSerial() {
-  // รูปแบบข้อมูลสำหรับ Serial Plotter: SP, PV, Output
-  Serial.print("Set:"); Serial.print(Setpoint); Serial.print(",");
-  Serial.print("PV:"); Serial.print(Input); Serial.print(",");
-  Serial.print("Out:"); Serial.println(Output);
+  // รูปแบบข้อมูลสำหรับ Serial Plotter: Raw, Filtered, PWM, Kalman Gain
+  Serial.print("Raw:"); Serial.print(rawTemp); Serial.print(",");
+  Serial.print("Filt:"); Serial.print(filteredTemp); Serial.print(",");
+  Serial.print("PWM:"); Serial.print(PWM_FIXED_VALUE); Serial.print(",");
+  Serial.print("KGain:"); Serial.println(tempKalmanFilter.getKalmanGain(), 4);
 }
