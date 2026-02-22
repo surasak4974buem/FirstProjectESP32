@@ -1,12 +1,12 @@
 /**
- * ESP32 Kalman Filter Temperature Monitoring System
+ * ESP32 Kalman Filter Temperature Monitoring System (Ver1)
  * ---------------------------------------------------
  * รายละเอียด Hardware:
  * - MCU: ESP32 DevKit V2 Board (THAITECHZONE)
  * - Sensor: DS18B20 (ต่อที่ GPIO 14)
  * - Heater: MOSFET หรือ SSR (ต่อที่ GPIO 13) -> PWM คงที่ 40%
  * - Display: OLED 0.96" (I2C: SDA=21, SCL=22)
- * - Filter: Kalman Filter สำหรับกรองสัญญาณเซนเซอร์
+ * - Filter: SimpleKalmanFilter สำหรับกรองสัญญาณเซนเซอร์
  */
 
 #include <Arduino.h>
@@ -15,7 +15,7 @@
 #include <Adafruit_SSD1306.h>
 #include <OneWire.h>
 #include <DallasTemperature.h>
-#include "SimpleKalmanFilter.h"  // Kalman Filter สำหรับกรองสัญญาณเซนเซอร์
+#include <SimpleKalmanFilter.h>  // Kalman Filter สำหรับกรองสัญญาณเซนเซอร์
 
 
 // =========================================
@@ -24,12 +24,10 @@
 #define HEATER_PIN 13    // ขาจ่ายสัญญาณ PWM ไปยัง Heater Driver
 #define ONE_WIRE_BUS 14  // ขา Data ของ Sensor DS18B20
 
-// Manual Control IO / Isolated Inputs ถูกตัดออก (ไม่ใช้ในโหมด Fuzzy Logic ล้วน)
-
 // =========================================
 // 2. การตั้งค่าระบบ (System Settings)
 // =========================================
-// ขอบเคตอุณหภูมิและความปลอดภัย
+// ขอบเขตอุณหภูมิและความปลอดภัย
 #define TEMP_MIN 0.0     // ค่าต่ำสุดที่ยอมให้ตั้ง
 #define TEMP_MAX 100.0   // ค่าสูงสุด และจุดตัด Safety Cutoff
 
@@ -37,7 +35,7 @@
 const int PWM_FREQ = 1000;     // ความถี่ 1kHz (เหมาะกับ MOSFET)
 const int PWM_CHANNEL = 0;     // ช่องสัญญาณ PWM 0
 const int PWM_RESOLUTION = 8;  // ความละเอียด 8-bit (ค่า 0-255)
-const int PWM_FIXED_VALUE = 64;  // ค่า PWM คงที่ 20%
+const int PWM_FIXED_VALUE = 64;  // ค่า PWM คงที่ 25% (64 จาก 255)
 
 // =========================================
 // 3. ประกาศตัวแปรและ Object
@@ -54,19 +52,17 @@ DallasTemperature sensors(&oneWire);
 // =========================================
 // พารามิเตอร์ Kalman Filter
 // =========================================
-const double KALMAN_Q = 0.01;              // Process Noise (ความผันผวนของกระบวนการ)
-                                            // ค่าต่ำ = อุณหภูมิเปลี่ยนแปลงช้า
-                                            // ค่าสูง = อุณหภูมิเปลี่ยนแปลงเร็ว
-                                            
-const double KALMAN_R = 0.5;               // Sensor Noise (ความผันผวนของเซนเซอร์)
-                                            // ค่าต่ำ = เชื่อค่าเซนเซอร์มาก (กรองน้อย)
-                                            // ค่าสูง = เชื่อค่าเซนเซอร์น้อย (กรองมาก)
-                                            
-const double KALMAN_P = 1.0;               // Estimation Error Covariance (ค่าเริ่มต้น)
-const double KALMAN_INITIAL_VALUE = 25.0;  // ค่าอุณหภูมิเริ่มต้น (°C)
+/* * การเรียงพารามิเตอร์ของ SimpleKalmanFilter(mea_e, est_e, q)
+ * mea_e = Measurement Uncertainty (Sensor Noise) ค่า R
+ * est_e = Estimation Uncertainty (Error Covariance) ค่า P
+ * q     = Process Noise ค่า Q
+ */
+const float KALMAN_MEA_E = 0.5;   // Sensor Noise (ค่า R)
+const float KALMAN_EST_E = 1.0;   // Estimation Error (ค่า P)
+const float KALMAN_Q = 0.01;      // Process Noise (ค่า Q)
 
-// สร้าง Kalman Filter Object
-SimpleKalmanFilter tempKalmanFilter(KALMAN_Q, KALMAN_R, KALMAN_P, KALMAN_INITIAL_VALUE);
+// สร้าง Kalman Filter Object (ใช้ 3 พารามิเตอร์ตามที่ Library กำหนด)
+SimpleKalmanFilter tempKalmanFilter(KALMAN_MEA_E, KALMAN_EST_E, KALMAN_Q);
 
 // =========================================
 // ตัวแปรสำหรับการทดสอบ Kalman Filter
@@ -98,10 +94,10 @@ void drawMainScreen();
 void setup() {
   Serial.begin(115200);
   
-  // --- A. ตั้งค่า PWM สำหรับ Heater (คงที่ 40%) ---
+  // --- A. ตั้งค่า PWM สำหรับ Heater ---
   ledcSetup(PWM_CHANNEL, PWM_FREQ, PWM_RESOLUTION);
   ledcAttachPin(HEATER_PIN, PWM_CHANNEL);
-  ledcWrite(PWM_CHANNEL, PWM_FIXED_VALUE); // ตั้งค่า PWM คงที่ 40%
+  ledcWrite(PWM_CHANNEL, PWM_FIXED_VALUE); // ตั้งค่า PWM คงที่
 
   // --- B. เริ่มต้น Sensor ---
   sensors.begin();
@@ -125,11 +121,10 @@ void setup() {
   // บันทึกเวลาเริ่มต้น (จะรอ 1.5 วินาทีใน loop)
   startupTime = millis();
 
-  Serial.println(F("--- ESP32 Kalman Filter Test ---"));
-  Serial.println(F("PWM Fixed: 40%"));
-  Serial.print(F("Kalman Q:")); Serial.print(KALMAN_Q);
-  Serial.print(F(" R:")); Serial.print(KALMAN_R);
-  Serial.print(F(" P:")); Serial.println(KALMAN_P);
+  Serial.println(F("--- ESP32 Kalman Filter Test (Ver1) ---"));
+  Serial.print(F("Kalman Q (Process): ")); Serial.println(KALMAN_Q);
+  Serial.print(F("Kalman R (Sensor): ")); Serial.println(KALMAN_MEA_E);
+  Serial.print(F("Kalman P (Error): ")); Serial.println(KALMAN_EST_E);
 }
 
 void loop() {
@@ -148,8 +143,10 @@ void loop() {
   // 1. อ่านค่าอุณหภูมิ (ทุกๆ SENSOR_READ_INTERVAL)
   if (currentTime - lastSensorReadTime >= SENSOR_READ_INTERVAL) {
     sensors.requestTemperatures(); 
-    rawTemp = sensors.getTempCByIndex(0);             // อ่านค่าดิบจากเซนเซอร์
-    filteredTemp = tempKalmanFilter.update(rawTemp);  // กรองด้วย Kalman Filter
+    rawTemp = sensors.getTempCByIndex(0);                 // อ่านค่าดิบจากเซนเซอร์
+    
+    // แก้ไขคำสั่ง update เป็น updateEstimate ตาม Library
+    filteredTemp = tempKalmanFilter.updateEstimate(rawTemp);  
 
     lastSensorReadTime = currentTime;
   }
@@ -210,14 +207,14 @@ void drawMainScreen() {
 
   // แสดง PWM คงที่
   display.setCursor(0, 40);
-  display.print(F("PWM: 20% (Fixed)"));
+  display.print(F("PWM: Fixed"));
 
-  // แสดง Kalman Gain
+  // แสดง Kalman Gain (ดึงค่า Gain มาแสดงผล)
   display.setCursor(0, 50);
   display.print(F("K-Gain: "));
   display.print(tempKalmanFilter.getKalmanGain(), 3);
 
-  // กราฟแท่งแสดงกำลังไฟ Heater (คงที่ที่ 40%)
+  // กราฟแท่งแสดงกำลังไฟ Heater 
   int barHeight = map(PWM_FIXED_VALUE, 0, 255, 0, 64);
   display.drawRect(118, 0, 10, 64, WHITE); // กรอบเต็มความสูง
   display.fillRect(118, 64 - barHeight, 10, barHeight, WHITE); // ไส้ใน
