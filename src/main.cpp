@@ -47,7 +47,7 @@ void setup() {
   display.setTextColor(WHITE);
   display.setTextSize(1);
   display.setCursor(10, 20);
-  display.println(F("SYSTEM STARTING"));
+  display.println(F("SYSTEM STARTING.."));
   display.setCursor(10, 40);
   display.println(F("PID CONTROL"));
   display.display();
